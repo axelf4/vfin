@@ -1,0 +1,6 @@
+[package]
+name = "vfin"
+version = "0.1.0"
+authors = ["Axel Forsman <axelsfor@gmail.com>"]
+
+[dependencies]

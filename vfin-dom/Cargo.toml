@@ -1,0 +1,11 @@
+[package]
+name = "vfin-dom"
+version = "0.1.0"
+authors = ["Axel Forsman <axelsfor@gmail.com>"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "0.2.15"
+vfin = { path = ".." }

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+node_modules/
+*.wasm
+*.d.ts
+*.js
+!index.js
