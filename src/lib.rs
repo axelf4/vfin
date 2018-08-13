@@ -82,8 +82,6 @@ pub trait Context {
 
     /// Callback for when a render is started.
     fn on_start(&mut self);
-
-    // TODO Add flag for unmounting recursively
 }
 
 #[derive(Default)]
@@ -227,6 +225,20 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
         cd.pop();
     }
 
+    fn remove<C: Context>(
+        ctx: &mut C,
+        cd: &mut Vec<Movement>,
+        node: *const Vnode<C>,
+        index: usize,
+    ) {
+        cd.push(Movement::NthChild(index));
+        for child in get_children(node) {
+            remove(ctx, cd, child, 0);
+        }
+        cd.pop();
+        (unsafe { &*node }.t.unmount)(ctx, cd, index);
+    }
+
     fn diff_node<C: Context>(
         ctx: &mut C,
         cd: &mut Vec<Movement>,
@@ -238,7 +250,7 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
             (None, None) => {}
             (Some(node), None) => {
                 // Detach old node since new one is null
-                (node.t.unmount)(ctx, cd, index);
+                remove(ctx, cd, node, index);
             }
             (None, Some(node)) => {
                 // Attach new node since old one was null
@@ -247,7 +259,7 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
             (Some(old), Some(new)) => {
                 if old.t as *const _ != new.t as *const _ {
                     // Differing types; tear down and rebuild
-                    (old.t.unmount)(ctx, cd, index);
+                    remove(ctx, cd, old, index);
                     insert(ctx, cd, new, index);
                 } else {
                     // Diff attributes

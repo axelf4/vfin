@@ -72,6 +72,6 @@ vfin-dom is a vfin backend for the web.
 - [ ] New more performant diffing algorithm, using LIS or similar.
 - [ ] String keys. Currently only integer keys are supported.
 - [ ] Only send delta movements to context.
-- [ ] Recursive unmounting. Otherwise you'd get memory leaks in non-garbage
+- [x] Recursive unmounting. Otherwise you'd get memory leaks in non-garbage
   collected backends that don't store destructor addresses.
 
