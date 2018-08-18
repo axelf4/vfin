@@ -1,4 +1,4 @@
-const js = import("./js_hello_world");
+const js = import("./vfin_dom");
 
 export function exit_with_live_runtime() {
 	throw "SimulateInfiniteLoop";

@@ -1,38 +1,36 @@
 /* Virtual DOM API */
 
+#![feature(raw)]
 use diff::{diff, Action::*};
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
+use std::{mem, raw};
 
 mod diff;
 
-#[derive(Copy, Clone)]
-pub struct Vtype<C: Context> {
-    pub mount: fn(
+/// A virtual DOM type corresponding to a real DOM element.
+pub trait Vtype<C: Context, S = Self> {
+    /// Inserts the element at the specified position.
+    fn mount(
+        &mut self,
         ctx: &mut C,
-        attributes: std::collections::hash_map::Iter<C::Attribute, C::AttributeValue>,
         cd: &[Movement],
-        index: usize,
-    ),
+        attributes: std::collections::hash_map::Iter<C::Attribute, C::AttributeValue>,
+    );
     /// Remove the element at the specifed position.
     ///
     /// Necessarily per-type since all implementations might not store destructors.
-    pub unmount: fn(ctx: &mut C, cd: &[Movement], index: usize),
-    pub update_attributes:
-        fn(
-            ctx: &mut C,
-            cd: &[Movement],
-            index: usize,
-            set: &mut dyn Iterator<Item = (&C::Attribute, &C::AttributeValue)>,
-            remove: &mut dyn Iterator<Item = (&C::Attribute, &C::AttributeValue)>,
-        ),
-}
-
-impl<C: Context> std::fmt::Debug for Vtype<C> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:p}", self as *const _)
-    }
+    fn unmount(&mut self, ctx: &mut C, cd: &[Movement]);
+    /// Updates by removing and setting - replacing if necessary - the specified attibutes.
+    fn update_attributes(
+        &mut self,
+        ctx: &mut C,
+        cd: &[Movement],
+        set: &mut dyn Iterator<Item = (&C::Attribute, &C::AttributeValue)>,
+        remove: &mut dyn Iterator<Item = (&C::Attribute, &C::AttributeValue)>,
+        last_props: Option<&mut S>,
+    );
 }
 
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
@@ -47,43 +45,62 @@ pub enum Key {
 #[derive(Debug)]
 struct Vnode<C: Context + 'static> {
     /// The type of the node.
-    t: &'static Vtype<C>,
-    /// Key for efficient diffing. Unique among siblings.
-    /// If one sibling has an explicit key then all siblings must too.
+    t: *mut Vtype<C, ()>,
+    /// A key, unique among siblings, for efficient diffing.
+    /// If one sibling has an explicit key then all siblings must follow.
     key: Key,
     /// The number of children plus the sum of their descendants.
     descendants: usize,
     attributes: HashMap<C::Attribute, C::AttributeValue>,
 }
 
-/**
- * TODO change movement to only encode delta between calls to context.
- * have a NextSibling(index)
- * hava a Parent(/*maybe*/ index)
- * Question: how does removal work.
- * Evaluate whether we need to pass slice to context.
- *
- * With this change we would ideally only pass cd and not index to context.
- */
-
-/** Describes for DOM updating code where to find DOM node that need updating from the previous DOM
- * node that was updated. */
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
-pub enum Movement {
-    Up,
-    NthChild(usize),
+impl<C: Context> Drop for Vnode<C> {
+    fn drop(&mut self) {
+        // Deallocate node properties if needed
+        if !unsafe { mem::transmute::<_, raw::TraitObject>(self.t) }
+            .data
+            .is_null()
+        {
+            unsafe { Box::from_raw(self.t) };
+        }
+    }
 }
 
+/// Deltas for finding a DOM node starting from the last affected.
+///
+/// Removals should leave the cursor at the parent.
+/// After insertions, moves and updates the cursor should point to the affected node.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub enum Movement {
+    /// Move to the parent of the current node.
+    Parent,
+    /// Move to the n-th child of the current node.
+    NthChild(usize),
+    /// Equivalent to NthChild(0).
+    FirstChild,
+    /// Move to the next sibling. Equivalent to Parent, followed by NthChild(usize).
+    NextSibling(usize),
+}
+
+/// User-defined context for carrying out the patching. Passed to all callback.
 pub trait Context {
+    /// Type used as key for attributes.
     type Attribute: Eq + Hash;
+    /// The type of the attribute values.
     type AttributeValue: PartialEq;
 
-    fn move_node(&mut self, cd: &[Movement], from: usize, index: usize);
+    /// Moves the node at child index `from` to the location of `cd` at the same level.
+    fn move_node(&mut self, cd: &[Movement], from: usize);
 
     /// Callback for when a render is started.
     fn on_start(&mut self);
+
+    /// Constructs a new context for the root node specified by `cd`.
+    /// Used by components for rendering their own virtual tree.
+    fn derive_from(&mut self, cd: &[Movement]) -> Self;
 }
 
+/// A virtual DOM tree.
 #[derive(Default)]
 pub struct Vtree<C: Context + 'static> {
     stack: Vec<Vnode<C>>,
@@ -91,6 +108,7 @@ pub struct Vtree<C: Context + 'static> {
 }
 
 impl<C: Context> Vtree<C> {
+    /// Constructs a new, empty, `Vtree`.
     pub fn new() -> Vtree<C> {
         Vtree {
             stack: Vec::new(),
@@ -98,16 +116,28 @@ impl<C: Context> Vtree<C> {
         }
     }
 
-    pub fn create_element(&mut self, t: &'static Vtype<C>) {
+    /// Adds a node to the tree. Followed by a mandatory complementary call to `pop_parent`.
+    ///
+    /// Following calls will add children to the added node.
+    pub fn create_element<S: Vtype<C>>(&mut self, mut s: S) {
         self.parent_stack.push(self.stack.len());
         self.stack.push(Vnode {
-            t,
+            t: if std::mem::size_of::<S>() == 0 {
+                let t: &mut Vtype<C, S> = &mut s;
+                let mut raw_object: raw::TraitObject = unsafe { mem::transmute(t) };
+                raw_object.data = null_mut();
+                unsafe { mem::transmute(raw_object) }
+            } else {
+                let boxed: Box<Vtype<C, S>> = Box::new(s);
+                Box::into_raw(boxed) as *mut Vtype<C, ()>
+            },
             key: Key::None,
             attributes: HashMap::new(),
             descendants: 0,
         });
     }
 
+    /// Adds the specified attribute to the current node.
     pub fn add_attribute<V: Into<C::AttributeValue>>(&mut self, key: C::Attribute, value: V) {
         self.stack
             .last_mut()
@@ -116,6 +146,7 @@ impl<C: Context> Vtree<C> {
             .insert(key, value.into());
     }
 
+    /// Stops adding children to the current node.
     pub fn pop_parent(&mut self) {
         let child_descendants =
             self.stack[self
@@ -127,6 +158,7 @@ impl<C: Context> Vtree<C> {
         }
     }
 
+    /// Sets the key of the current node.
     pub fn set_key(&mut self, key: i32) {
         self.stack
             .last_mut()
@@ -134,52 +166,33 @@ impl<C: Context> Vtree<C> {
             .key = Key::Integer(key);
     }
 
-    /// Returns whether the type of the active parent matches the specified type.
+    /*/// Returns whether the type of the active parent matches the specified type.
     #[doc(hidden)]
     pub fn parent_type_eq(&self, t: &'static Vtype<C>) -> bool {
         self.stack[*self.parent_stack.last().unwrap()].t as *const _ == t as *const _
-    }
+    }*/
 }
 
-/// Returns an iterator of the children of a virtual node
-fn get_children<C: Context>(node: *const Vnode<C>) -> impl Iterator<Item = *const Vnode<C>> {
-    struct ChildIterator<C: Context + 'static> {
-        node: *const Vnode<C>,
-        i: usize,
-    }
-
-    impl<C: Context> Iterator for ChildIterator<C> {
-        type Item = *const Vnode<C>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            // Let there be nasal demons
-            unsafe {
-                if (*self.node).descendants < self.i {
-                    None
-                } else {
-                    let child = self.node.offset(self.i as isize);
-                    self.i += 1 + (*child).descendants;
-                    Some(child)
-                }
-            }
-        }
-    }
-
-    ChildIterator { node, i: 1 }
-}
-
+/// A convenience macro for building trees with a HTML-esque language.
 #[macro_export]
 macro_rules! html {
-    ($ctx:ident, < $tag:ident $($tt:tt)*) => {
-        $ctx.create_element(&$tag);
+    // Start of component tag
+    ($ctx:ident, <C $cmp:expr, $($tt:tt)*) => {
+        $ctx.create_element($cmp);
         html!{@tag $ctx, $($tt)*}
     };
+    // Start of opening tag
+    ($ctx:ident, < $tag:ident $($tt:tt)*) => {
+        $ctx.create_element($tag);
+        html!{@tag $ctx, $($tt)*}
+    };
+    // End tag
     ($ctx:ident, </ $tag:ident > $($tt:tt)*) => {
-        debug_assert!($ctx.parent_type_eq(&$tag), "Mismatched closing tag.");
+        // debug_assert!($ctx.parent_type_eq(&$tag), "Mismatched closing tag.");
         $ctx.pop_parent();
         html!{$ctx, $($tt)*}
     };
-    /* Self-closing tag */
+    // Self-closing tag
     (@tag $ctx:ident, /> $($tt:tt)*) => {
         $ctx.pop_parent();
         html!{$ctx, $($tt)*}
@@ -206,37 +219,63 @@ macro_rules! html {
     ($ctx:ident,) => {};
 }
 
-pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
-    // Stack of where to go to find next DOM node that needs updating
-    let mut cd: Vec<Movement> = Vec::new();
-    ctx.on_start();
-
-    fn insert<C: Context>(
-        ctx: &mut C,
-        cd: &mut Vec<Movement>,
+/// Returns an iterator of the children of a virtual node.
+fn get_children<C: Context>(node: *const Vnode<C>) -> impl Iterator<Item = *const Vnode<C>> {
+    struct ChildIterator<C: Context + 'static> {
         node: *const Vnode<C>,
-        index: usize,
-    ) {
-        (unsafe { &*node }.t.mount)(ctx, unsafe { &*node }.attributes.iter(), cd, index);
-        cd.push(Movement::NthChild(index));
-        for child in get_children(node).enumerate() {
-            insert(ctx, cd, child.1, child.0);
-        }
-        cd.pop();
+        i: usize,
     }
 
-    fn remove<C: Context>(
-        ctx: &mut C,
-        cd: &mut Vec<Movement>,
-        node: *const Vnode<C>,
-        index: usize,
-    ) {
-        cd.push(Movement::NthChild(index));
-        for child in get_children(node) {
-            remove(ctx, cd, child, 0);
+    impl<C: Context> Iterator for ChildIterator<C> {
+        type Item = *const Vnode<C>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            // Let there be nasal demons
+            unsafe {
+                if (*self.node).descendants < self.i {
+                    None
+                } else {
+                    let child = self.node.offset(self.i as isize);
+                    self.i += 1 + (*child).descendants;
+                    Some(child)
+                }
+            }
         }
-        cd.pop();
-        (unsafe { &*node }.t.unmount)(ctx, cd, index);
+    }
+
+    ChildIterator { node, i: 1 }
+}
+
+/// Patches the `previous` tree to the one in `next`, with the specified context `ctx`.
+pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
+    use Movement::{FirstChild, NextSibling};
+    // Stack of where to go to find next DOM node that needs updating
+    let mut cd: Vec<Movement> = vec![FirstChild];
+    ctx.on_start();
+
+    /// Recursively mount the specified node.
+    fn insert<C: Context>(ctx: &mut C, cd: &mut Vec<Movement>, node: *const Vnode<C>) {
+        unsafe { &mut *(*node).t }.mount(ctx, cd, unsafe { &*node }.attributes.iter());
+        cd.clear();
+        let mut has_children = false;
+        for (i, child) in get_children(node).enumerate() {
+            cd.push(if i == 0 { FirstChild } else { NextSibling(i) });
+            insert(ctx, cd, child);
+            has_children = true;
+        }
+        if has_children {
+            cd.push(Movement::Parent);
+        }
+    }
+
+    /// Recursively unmount the specified node.
+    fn remove<C: Context>(ctx: &mut C, cd: &mut Vec<Movement>, node: *const Vnode<C>) {
+        for child in get_children(node) {
+            cd.push(FirstChild);
+            remove(ctx, cd, child);
+            cd.clear();
+        }
+        unsafe { &mut *(*node).t }.unmount(ctx, cd);
     }
 
     fn diff_node<C: Context>(
@@ -244,29 +283,33 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
         cd: &mut Vec<Movement>,
         p: *const Vnode<C>,
         n: *const Vnode<C>,
-        index: usize,
     ) {
         match unsafe { (p.as_ref(), n.as_ref()) } {
             (None, None) => {}
             (Some(node), None) => {
-                // Detach old node since new one is null
-                remove(ctx, cd, node, index);
+                remove(ctx, cd, node);
             }
             (None, Some(node)) => {
-                // Attach new node since old one was null
-                insert(ctx, cd, node, index);
+                insert(ctx, cd, node);
             }
             (Some(old), Some(new)) => {
-                if old.t as *const _ != new.t as *const _ {
+                if unsafe { mem::transmute::<_, raw::TraitObject>(old.t) }.vtable
+                    != unsafe { mem::transmute::<_, raw::TraitObject>(new.t) }.vtable
+                {
                     // Differing types; tear down and rebuild
-                    remove(ctx, cd, old, index);
-                    insert(ctx, cd, new, index);
+                    let next = match *cd.last().unwrap() {
+                        Movement::NextSibling(i) => Movement::NthChild(i),
+                        movement => movement,
+                    };
+                    remove(ctx, cd, old);
+                    cd.clear();
+                    cd.push(next);
+                    insert(ctx, cd, new);
                 } else {
                     // Diff attributes
-                    (new.t.update_attributes)(
+                    unsafe { &mut *new.t }.update_attributes(
                         ctx,
                         cd,
-                        index,
                         &mut new.attributes.iter().filter(|(key, val)| {
                             old.attributes
                                 .get(key)
@@ -276,10 +319,11 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
                             .attributes
                             .iter()
                             .filter(|(key, _)| !new.attributes.contains_key(key)),
+                        unsafe { mem::transmute::<_, raw::TraitObject>(old.t).data.as_mut() },
                     );
+                    cd.clear();
 
                     // Diff children
-                    cd.push(Movement::NthChild(index));
                     let (pchildren, nchildren) = (
                         get_children(p).collect::<Vec<_>>(),
                         get_children(n).collect::<Vec<_>>(),
@@ -298,24 +342,39 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
                             }).collect::<Vec<_>>()
                     };
 
+                    let mut first = true;
                     for action in diff(&get_keys(&pchildren), &get_keys(&nchildren)) {
                         match action {
-                            Insert(i) => {
-                                diff_node(ctx, cd, null(), nchildren[i], i);
-                            }
+                            // Removals are always done first
                             Remove(i) => {
-                                diff_node(ctx, cd, pchildren[i], null(), i);
+                                cd.push(Movement::NthChild(i));
+                                remove(ctx, cd, pchildren[i]);
+                                cd.clear();
+                            }
+                            Insert(i) => {
+                                cd.push(if first { FirstChild } else { NextSibling(i) });
+                                first = false;
+                                insert(ctx, cd, nchildren[i]);
+                                cd.clear();
                             }
                             Move(i, j, old_index) => {
-                                ctx.move_node(cd, i, j);
-                                diff_node(ctx, cd, pchildren[old_index], nchildren[j], i);
+                                cd.push(if first { FirstChild } else { NextSibling(j) });
+                                first = false;
+                                ctx.move_node(cd, i);
+                                cd.clear();
+                                diff_node(ctx, cd, pchildren[old_index], nchildren[j]);
                             }
                             Update(i, j) => {
-                                diff_node(ctx, cd, pchildren[j], nchildren[i], i);
+                                cd.push(if first { FirstChild } else { NextSibling(i) });
+                                first = false;
+                                diff_node(ctx, cd, pchildren[j], nchildren[i]);
                             }
                         }
                     }
-                    cd.pop();
+                    // If first is false we are in child land
+                    if !first {
+                        cd.push(Movement::Parent);
+                    }
                 }
             }
         }
@@ -335,7 +394,6 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
         } else {
             next.stack.as_ptr()
         },
-        0,
     );
 }
 
