@@ -4,8 +4,7 @@
 use diff::{diff, Action::*};
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::ptr::{null, null_mut};
-use std::{mem, raw};
+use std::{mem, ptr::null_mut, raw};
 
 mod diff;
 
@@ -220,25 +219,23 @@ macro_rules! html {
 }
 
 /// Returns an iterator of the children of a virtual node.
-fn get_children<C: Context>(node: *const Vnode<C>) -> impl Iterator<Item = *const Vnode<C>> {
-    struct ChildIterator<C: Context + 'static> {
-        node: *const Vnode<C>,
+fn get_children<'a, C: Context>(node: &'a Vnode<C>) -> impl Iterator<Item = &'a Vnode<C>> {
+    struct ChildIterator<'a, C: Context + 'static> {
+        node: &'a Vnode<C>,
         i: usize,
     }
 
-    impl<C: Context> Iterator for ChildIterator<C> {
-        type Item = *const Vnode<C>;
+    impl<'a, C: Context> Iterator for ChildIterator<'a, C> {
+        type Item = &'a Vnode<C>;
 
         fn next(&mut self) -> Option<Self::Item> {
-            // Let there be nasal demons
-            unsafe {
-                if (*self.node).descendants < self.i {
-                    None
-                } else {
-                    let child = self.node.offset(self.i as isize);
-                    self.i += 1 + (*child).descendants;
-                    Some(child)
-                }
+            if self.node.descendants < self.i {
+                None
+            } else {
+                // Let there be nasal demons
+                let child: &_ = unsafe { &*(self.node as *const Vnode<_>).offset(self.i as isize) };
+                self.i += 1 + child.descendants;
+                Some(child)
             }
         }
     }
@@ -254,8 +251,8 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
     ctx.on_start();
 
     /// Recursively mount the specified node.
-    fn insert<C: Context>(ctx: &mut C, cd: &mut Vec<Movement>, node: *const Vnode<C>) {
-        unsafe { &mut *(*node).t }.mount(ctx, cd, unsafe { &*node }.attributes.iter());
+    fn insert<C: Context>(ctx: &mut C, cd: &mut Vec<Movement>, node: &Vnode<C>) {
+        unsafe { &mut *node.t }.mount(ctx, cd, node.attributes.iter());
         cd.clear();
         let mut has_children = false;
         for (i, child) in get_children(node).enumerate() {
@@ -269,22 +266,22 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
     }
 
     /// Recursively unmount the specified node.
-    fn remove<C: Context>(ctx: &mut C, cd: &mut Vec<Movement>, node: *const Vnode<C>) {
+    fn remove<C: Context>(ctx: &mut C, cd: &mut Vec<Movement>, node: &Vnode<C>) {
         for child in get_children(node) {
             cd.push(FirstChild);
             remove(ctx, cd, child);
             cd.clear();
         }
-        unsafe { &mut *(*node).t }.unmount(ctx, cd);
+        unsafe { &mut *node.t }.unmount(ctx, cd);
     }
 
     fn diff_node<C: Context>(
         ctx: &mut C,
         cd: &mut Vec<Movement>,
-        p: *const Vnode<C>,
-        n: *const Vnode<C>,
+        p: Option<&Vnode<C>>,
+        n: Option<&Vnode<C>>,
     ) {
-        match unsafe { (p.as_ref(), n.as_ref()) } {
+        match (p, n) {
             (None, None) => {}
             (Some(node), None) => {
                 remove(ctx, cd, node);
@@ -325,13 +322,13 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
 
                     // Diff children
                     let (pchildren, nchildren) = (
-                        get_children(p).collect::<Vec<_>>(),
-                        get_children(n).collect::<Vec<_>>(),
+                        get_children(old).collect::<Vec<_>>(),
+                        get_children(new).collect::<Vec<_>>(),
                     );
-                    let get_keys = |children: &Vec<*const Vnode<C>>| {
+                    let get_keys = |children: &Vec<&Vnode<C>>| {
                         children
                             .iter()
-                            .map(|&x| unsafe { &*x }.key)
+                            .map(|&x| x.key)
                             .enumerate()
                             .map(|(i, x)| {
                                 if let Key::None = x {
@@ -362,12 +359,12 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
                                 first = false;
                                 ctx.move_node(cd, i);
                                 cd.clear();
-                                diff_node(ctx, cd, pchildren[old_index], nchildren[j]);
+                                diff_node(ctx, cd, Some(pchildren[old_index]), Some(nchildren[j]));
                             }
                             Update(i, j) => {
                                 cd.push(if first { FirstChild } else { NextSibling(i) });
                                 first = false;
-                                diff_node(ctx, cd, pchildren[j], nchildren[i]);
+                                diff_node(ctx, cd, Some(pchildren[j]), Some(nchildren[i]));
                             }
                         }
                     }
@@ -381,20 +378,7 @@ pub fn patch<C: Context>(ctx: &mut C, prev: Vtree<C>, next: &Vtree<C>) {
     }
 
     // Diff root nodes
-    diff_node(
-        ctx,
-        &mut cd,
-        if prev.stack.is_empty() {
-            null()
-        } else {
-            prev.stack.as_ptr()
-        },
-        if next.stack.is_empty() {
-            null()
-        } else {
-            next.stack.as_ptr()
-        },
-    );
+    diff_node(ctx, &mut cd, prev.stack.first(), next.stack.first());
 }
 
 #[cfg(test)]
